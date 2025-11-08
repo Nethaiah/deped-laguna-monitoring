@@ -1,23 +1,19 @@
 """
-DepEd Laguna Memorandum Auto-Monitoring + Supabase Uploader (Cloud-Driven, memory-only)
-- Streams files from SharePoint (memory-only) with robust URL conversion
-- Uploads them to Supabase Storage -> documents/docs_from_watcher/
-- Inserts metadata into `notifications` table
-- Uses Supabase storage listing as forward-only baseline (no local state)
-- Writes structured JSONL logs to monitor_log.jsonl
+DepEd Laguna Memorandum Auto-Monitoring (Cloud-Optimized Logging)
+- Logs to both console (stdout) and Supabase 'logs' table
+- No local file dependencies
+- Cloud-ready (GitHub Actions, Railway, Render, etc.)
 """
 
 import argparse
-
 import json
-
 import logging
 import mimetypes
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
-import dotenv
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,47 +24,77 @@ from urllib3.util import Retry
 # ---------------- CONFIG ----------------
 BASE_URL_TEMPLATE = "https://depedlaguna.com/division-memorandum-{year}/"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-LOG_JSONL = "monitor_log.jsonl"
 TIMEOUT = 30
 DEFAULT_INTERVAL = 30
 DEFAULT_WATCH_DURATION = 180
 
-# Supabase (kept in-file per your request)
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+# Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hovcopesgsbgufrmiheu.supabase.co")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhvdmNvcGVzZ3NiZ3Vmcm1paGV1Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MjU3MjM3MywiZXhwIjoyMDc4MTQ4MzczfQ.IxA9C6TXaRnX1Ap5BdSoZYkDRAzBw8iVTEBC0gXgTYs")
 SUPABASE_BUCKET = "documents"
 SUPABASE_FOLDER = "docs_from_watcher"
+
+# Cloud environment detection
+IS_CLOUD = os.getenv("GITHUB_ACTIONS") or os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RENDER")
 # ----------------------------------------
 
 # create supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+# Configure stdout logging for cloud
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
 
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
-def log_jsonl(level: str, event: str, **kwargs):
+def log_to_supabase(level: str, event: str, **kwargs):
+    """
+    Insert log entry into Supabase 'logs' table.
+    Fails silently if table doesn't exist.
+    """
+    try:
+        log_entry = {
+            "timestamp": now_iso(),
+            "level": level,
+            "event": event,
+            "data": kwargs  # Store additional data as JSON
+        }
+        supabase.table("logs").insert(log_entry).execute()
+    except Exception as e:
+        # Don't let logging failures break the app
+        logging.debug(f"Failed to log to Supabase: {e}")
+
+
+def log_event(level: str, event: str, **kwargs):
+    """
+    Unified logging: prints to console (for cloud logs) and saves to Supabase
+    """
     entry = {
         "timestamp": now_iso(),
         "level": level,
         "event": event,
     }
     entry.update(kwargs)
-    line = json.dumps(entry, ensure_ascii=False)
-    # append to JSONL file
-    try:
-        with open(LOG_JSONL, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except Exception as e:
-        # fallback to basic logging if JSONL fails
-        logging.basicConfig(level=logging.INFO)
-        logging.error(f"Failed to write JSONL log: {e}")
-    # also print for convenience
+    
+    # Always print to console (this is captured by cloud platforms)
+    log_line = json.dumps(entry, ensure_ascii=False)
+    
     if level == "ERROR":
-        logging.error(entry)
+        logging.error(log_line)
+    elif level == "WARNING":
+        logging.warning(log_line)
     else:
-        logging.info(entry)
+        logging.info(log_line)
+    
+    # Also save to Supabase for persistent storage
+    if not kwargs.get('skip_db'):
+        log_to_supabase(level, event, **kwargs)
 
 
 class MemoMonitor:
@@ -98,15 +124,12 @@ class MemoMonitor:
         Returns integer 0 if none found or on error.
         """
         try:
-            resp = supabase.storage.from_(SUPABASE_BUCKET).list(
-                SUPABASE_FOLDER
-            )  # may raise or return list
+            resp = supabase.storage.from_(SUPABASE_BUCKET).list(SUPABASE_FOLDER)
             files = resp or []
             if not isinstance(files, list):
-                # sometimes client returns dict with 'data' key
                 files = resp.get("data") if isinstance(resp, dict) else []
             if not files:
-                log_jsonl(
+                log_event(
                     "INFO",
                     "supabase_baseline_empty",
                     message="No files in Supabase folder",
@@ -114,7 +137,6 @@ class MemoMonitor:
                 return 0
             numbers = []
             for f in files:
-                # f may be dict with 'name' or string depending on SDK version
                 fname = f.get("name") if isinstance(f, dict) else (f or "")
                 match = re.search(r"No[_\-]?(\d+)", fname)
                 if match:
@@ -123,12 +145,12 @@ class MemoMonitor:
                     except:
                         continue
             latest = max(numbers) if numbers else 0
-            log_jsonl(
+            log_event(
                 "INFO", "supabase_baseline", latest=latest, files_count=len(files)
             )
             return latest
         except Exception as e:
-            log_jsonl("ERROR", "supabase_baseline_error", message=str(e))
+            log_event("ERROR", "supabase_baseline_error", message=str(e))
             return 0
 
     # ---------------- scraping ----------------
@@ -143,13 +165,13 @@ class MemoMonitor:
         Only memos with number > cached_latest_number (forward-only) will be returned.
         """
         url = BASE_URL_TEMPLATE.format(year=year)
-        log_jsonl("INFO", "check_year_start", year=year, url=url)
+        log_event("INFO", "check_year_start", year=year, url=url)
         try:
             r = self._get_page(url)
             soup = BeautifulSoup(r.text, "html.parser")
             table = soup.find("table")
             if not table:
-                log_jsonl("WARNING", "no_table_found", year=year)
+                log_event("WARNING", "no_table_found", year=year)
                 return []
             rows = table.find_all("tr")[1:]
             if self._cached_latest_number is None:
@@ -179,12 +201,12 @@ class MemoMonitor:
                         "sharepoint_url": sharepoint_url,
                     }
                 )
-            log_jsonl(
+            log_event(
                 "INFO", "fetch_year_complete", year=year, new_count=len(new_entries)
             )
             return new_entries
         except Exception as e:
-            log_jsonl("ERROR", "fetch_year_failed", year=year, error=str(e))
+            log_event("ERROR", "fetch_year_failed", year=year, error=str(e))
             return []
 
     # ---------------- SharePoint URL conversion ----------------
@@ -224,7 +246,7 @@ class MemoMonitor:
             download_urls.append(sharepoint_url)
             
         except Exception as e:
-            log_jsonl("WARNING", "url_conversion_error", error=str(e))
+            log_event("WARNING", "url_conversion_error", error=str(e))
             download_urls.append(sharepoint_url)
         
         # Remove duplicates while preserving order
@@ -244,12 +266,13 @@ class MemoMonitor:
         Returns (bytes, mime_type) or (None, None) on failure.
         """
         download_urls = self.convert_sharepoint_to_download_url(sharepoint_url)
-        log_jsonl("INFO", "attempting_download", memo_number=memo_number, strategies=len(download_urls))
+        log_event("INFO", "attempting_download", memo_number=memo_number, strategies=len(download_urls))
         
         last_error = None
         for attempt, download_url in enumerate(download_urls, 1):
             try:
-                log_jsonl("DEBUG", "download_attempt", attempt=attempt, url=download_url[:100])
+                # Use skip_db=True for attempt logs to reduce DB writes
+                log_event("DEBUG", "download_attempt", attempt=attempt, url=download_url[:100], skip_db=True)
                 
                 r = self.session.get(download_url, timeout=TIMEOUT, allow_redirects=True)
                 
@@ -267,17 +290,18 @@ class MemoMonitor:
                     if len(content) < 1000:
                         # Suspiciously small, verify PDF magic bytes
                         if b"%PDF" not in content[:100]:
-                            log_jsonl(
+                            log_event(
                                 "WARNING",
                                 "small_invalid_pdf",
                                 attempt=attempt,
-                                size=len(content)
+                                size=len(content),
+                                skip_db=True
                             )
                             last_error = f"Invalid PDF (size: {len(content)} bytes)"
                             continue
                     
                     mime = "application/pdf"
-                    log_jsonl(
+                    log_event(
                         "INFO",
                         "download_success",
                         memo_number=memo_number,
@@ -286,22 +310,22 @@ class MemoMonitor:
                     )
                     return content, mime
                 else:
-                    log_jsonl(
+                    log_event(
                         "WARNING",
                         "not_pdf_response",
                         attempt=attempt,
                         content_type=content_type,
-                        content_start=content[:50].hex()
+                        skip_db=True
                     )
                     last_error = f"Non-PDF response: {content_type}"
                     
             except Exception as e:
-                log_jsonl("WARNING", "download_attempt_failed", attempt=attempt, error=str(e))
+                log_event("WARNING", "download_attempt_failed", attempt=attempt, error=str(e), skip_db=True)
                 last_error = str(e)
                 continue
         
         # All attempts failed
-        log_jsonl(
+        log_event(
             "ERROR",
             "download_failed_all_attempts",
             memo_number=memo_number,
@@ -325,7 +349,7 @@ class MemoMonitor:
             )
             # Handle variations of return type / errors
             if isinstance(result, dict) and result.get("error"):
-                log_jsonl(
+                log_event(
                     "ERROR",
                     "upload_error",
                     filename=filename,
@@ -333,7 +357,7 @@ class MemoMonitor:
                 )
                 return None
             if hasattr(result, "error") and getattr(result, "error", None):
-                log_jsonl(
+                log_event(
                     "ERROR",
                     "upload_error_attr",
                     filename=filename,
@@ -351,12 +375,12 @@ class MemoMonitor:
                 )
             else:
                 public_url = public
-            log_jsonl(
+            log_event(
                 "INFO", "upload_success", filename=filename, public_url=public_url
             )
             return public_url
         except Exception as e:
-            log_jsonl("ERROR", "upload_exception", filename=filename, error=str(e))
+            log_event("ERROR", "upload_exception", filename=filename, error=str(e))
             return None
 
     # ---------------- notifications insert ----------------
@@ -377,17 +401,17 @@ class MemoMonitor:
             )
             # check response for errors depending on client version
             if isinstance(resp, dict) and resp.get("error"):
-                log_jsonl(
+                log_event(
                     "ERROR",
                     "db_insert_error",
                     memo_number=memo_number,
                     error=resp.get("error"),
                 )
                 return False
-            log_jsonl("INFO", "db_insert_success", memo_number=memo_number, url=url)
+            log_event("INFO", "db_insert_success", memo_number=memo_number, url=url)
             return True
         except Exception as e:
-            log_jsonl(
+            log_event(
                 "ERROR", "db_insert_exception", memo_number=memo_number, error=str(e)
             )
             return False
@@ -402,14 +426,14 @@ class MemoMonitor:
     # ---------------- process ----------------
     def process_new_memos(self, entries):
         if not entries:
-            log_jsonl("INFO", "no_new_memos")
+            log_event("INFO", "no_new_memos")
             return
         for entry in entries:
             memo_number = entry["memo_number"]
             title = entry["title"]
             date = entry.get("date")
             sharepoint_url = entry["sharepoint_url"]
-            log_jsonl(
+            log_event(
                 "INFO",
                 "memo_discovered",
                 memo_number=memo_number,
@@ -421,7 +445,7 @@ class MemoMonitor:
             file_bytes, mime = self.download_bytes(sharepoint_url, memo_number)
             if not file_bytes:
                 # invalid download – skip
-                log_jsonl("WARNING", "skip_invalid_download", memo_number=memo_number)
+                log_event("WARNING", "skip_invalid_download", memo_number=memo_number)
                 continue
 
             # Build filename and upload
@@ -434,7 +458,7 @@ class MemoMonitor:
             # Insert notification
             inserted = self.insert_notification(memo_number, title, date, record_url)
             if not inserted:
-                log_jsonl(
+                log_event(
                     "ERROR", "notification_insert_failed", memo_number=memo_number
                 )
 
@@ -448,7 +472,7 @@ class MemoMonitor:
                         or num > self._cached_latest_number
                     ):
                         self._cached_latest_number = num
-                        log_jsonl(
+                        log_event(
                             "INFO",
                             "update_cached_latest",
                             latest=self._cached_latest_number,
@@ -461,7 +485,7 @@ class MemoMonitor:
 
     # ---------------- run ----------------
     def run_once(self):
-        log_jsonl("INFO", "run_start")
+        log_event("INFO", "run_start", environment="cloud" if IS_CLOUD else "local")
         all_new = []
         current_year = datetime.now().year
         for year in [current_year, current_year + 1]:
@@ -479,29 +503,31 @@ class MemoMonitor:
             new = self.fetch_memos_for_year(year)
             all_new.extend(new)
         if all_new:
-            log_jsonl("INFO", "new_memos_total", count=len(all_new))
+            log_event("INFO", "new_memos_total", count=len(all_new))
         self.process_new_memos(all_new)
-        log_jsonl("INFO", "run_complete")
+        log_event("INFO", "run_complete")
 
     def run_continuous(self):
-        log_jsonl("INFO", "continuous_start", interval=self.interval)
+        log_event("INFO", "continuous_start", interval=self.interval)
         try:
             while True:
                 self.run_once()
                 time.sleep(self.interval)
         except KeyboardInterrupt:
-            log_jsonl("INFO", "stopped_by_user")
+            log_event("INFO", "stopped_by_user")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DepEd Laguna Memo Auto Monitor (Supabase, memory-only)"
+        description="DepEd Laguna Memo Auto Monitor (Cloud-Ready)"
     )
     parser.add_argument(
         "--interval", type=int, default=DEFAULT_INTERVAL, help="Poll interval seconds"
     )
     parser.add_argument("--once", action="store_true", help="Run once and exit")
     args = parser.parse_args()
+
+    log_event("INFO", "monitor_started", mode="once" if args.once else "continuous")
 
     monitor = MemoMonitor(interval=args.interval)
 
